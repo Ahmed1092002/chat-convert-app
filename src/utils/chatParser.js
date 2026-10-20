@@ -30,7 +30,6 @@ export function repairMojibake(text) {
       } else if (REVERSE_CP1252.has(code)) {
         bytes.push(REVERSE_CP1252.get(code));
       } else {
-        // Fallback to latin1 truncation if applicable
         bytes.push(code & 0xff);
       }
     }
@@ -48,6 +47,31 @@ export function repairMojibake(text) {
   } catch {
     return text;
   }
+}
+
+/**
+ * Strips raw GenUI / custom tags if fallbackMarkdown wasn't available
+ */
+function cleanGenUiTags(str) {
+  if (!str) return '';
+  return str
+    .replace(/<box[^>]*>/gi, '')
+    .replace(/<\/box>/gi, '\n')
+    .replace(/<grid[^>]*>/gi, '')
+    .replace(/<\/grid>/gi, '\n')
+    .replace(/<grid-item[^>]*>/gi, '')
+    .replace(/<\/grid-item>/gi, '\n')
+    .replace(/<row[^>]*>/gi, '')
+    .replace(/<\/row>/gi, '\n')
+    .replace(/<text[^>]*>/gi, '')
+    .replace(/<\/text>/gi, '\n')
+    .replace(/<icon[^>]*\/>/gi, '')
+    .replace(/<divider[^>]*\/>/gi, '\n---\n')
+    .replace(/\{@body[^\}]*\}/gi, '')
+    .replace(/<radio-group[^>]*>[\s\S]*?<\/radio-group>/gi, '')
+    .replace(/\{#if[^\}]*\}[\s\S]*?\{\/if\}/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 export function getTextFromContent(content, fixMojibake) {
@@ -94,7 +118,61 @@ export function getActivePath(mapping, currentNode) {
 }
 
 /**
- * Extracts messages from a single ChatGPT conversation object
+ * Extracts a normalized single message item from various format flavors
+ */
+function normalizeMessageItem(item, fixMojibake) {
+  if (!item) return null;
+
+  let sender = 'unknown';
+  if (item.author && item.author.role) {
+    sender = item.author.role;
+  } else if (item.sender) {
+    sender = item.sender === 'human' ? 'user' : item.sender;
+  } else if (item.role) {
+    sender = item.role;
+  }
+
+  // Handle reasoning recap (e.g. "Worked for 5s")
+  const isReasoning = item.content && item.content.content_type === 'reasoning_recap';
+
+  let text = '';
+  // Check if fallback markdown is available in metadata (ChatGPT GenUI)
+  if (item.metadata?.model_dil_v2?.fallbackMarkdown) {
+    text = item.metadata.model_dil_v2.fallbackMarkdown;
+  } else if (item.content) {
+    if (typeof item.content === 'string') {
+      text = item.content;
+    } else if (item.content.content) {
+      text = item.content.content;
+    } else {
+      text = getTextFromContent(item.content, fixMojibake);
+    }
+  } else if (typeof item.message === 'string') {
+    text = item.message;
+  } else if (typeof item.text === 'string') {
+    text = item.text;
+  }
+
+  if (fixMojibake) {
+    text = repairMojibake(text);
+  }
+
+  // If text contains JSX box/grid tags, clean them
+  if (text.includes('<box') || text.includes('<icon') || text.includes('__dil')) {
+    text = cleanGenUiTags(text);
+  }
+
+  return {
+    id: item.id || item.uuid || Math.random().toString(36).substring(2, 9),
+    sender,
+    isReasoning,
+    message: text.trim(),
+    create_time: item.create_time || item.created_at || item.timestamp || null,
+  };
+}
+
+/**
+ * Extracts messages from a single ChatGPT conversation object with `mapping`
  */
 export function extractFromConversation(convo, { includeSystem = false, fixMojibake = false, onlyActive = true } = {}) {
   const mapping = convo.mapping || {};
@@ -109,17 +187,17 @@ export function extractFromConversation(convo, { includeSystem = false, fixMojib
       const messageObj = mapping[id] && mapping[id].message;
       if (!messageObj) return null;
 
-      const sender = messageObj.author && messageObj.author.role ? messageObj.author.role : "unknown";
-      if (allowedRoles && !allowedRoles.has(sender)) return null;
-
-      const text = getTextFromContent(messageObj.content, fixMojibake).trim();
-      if (!text) return null;
+      const norm = normalizeMessageItem(messageObj, fixMojibake);
+      if (!norm) return null;
+      if (norm.isReasoning && !includeSystem) return null;
+      if (allowedRoles && !allowedRoles.has(norm.sender)) return null;
+      if (!norm.message) return null;
 
       return {
-        id,
-        sender,
-        message: text,
-        create_time: messageObj.create_time || null,
+        id: norm.id,
+        sender: norm.sender,
+        message: norm.message,
+        create_time: norm.create_time,
       };
     })
     .filter(Boolean);
@@ -133,79 +211,99 @@ export function extractFromConversation(convo, { includeSystem = false, fixMojib
 }
 
 /**
+ * Extracts messages from an object with a `messages` array
+ */
+function extractFromMessagesArray(convoObj, messagesArray, { includeSystem = false, fixMojibake = false } = {}) {
+  const allowedRoles = includeSystem ? null : new Set(["user", "assistant"]);
+
+  const messages = messagesArray
+    .map((item) => {
+      const norm = normalizeMessageItem(item, fixMojibake);
+      if (!norm) return null;
+      if (norm.isReasoning && !includeSystem) return null;
+      if (allowedRoles && !allowedRoles.has(norm.sender)) return null;
+      if (!norm.message) return null;
+
+      return {
+        id: norm.id,
+        sender: norm.sender,
+        message: norm.message,
+        create_time: norm.create_time,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    id: convoObj?.conversation_id || convoObj?.id || Math.random().toString(36).substring(2, 9),
+    title: convoObj?.title ? (fixMojibake ? repairMojibake(convoObj.title) : convoObj.title) : "Conversation",
+    create_time: convoObj?.create_time || null,
+    messages,
+  };
+}
+
+/**
  * Generic parser that handles ChatGPT export, single convo, Claude, or simple JSON array
  */
 export function parseChatData(parsedJson, options = {}) {
   const { includeSystem = false, fixMojibake = false, onlyActive = true } = options;
 
-  // Case 1: ChatGPT full export array: [ { title, mapping, current_node }, ... ]
+  // Case 1: Array of conversations or array of messages
   if (Array.isArray(parsedJson)) {
-    // Check if it's ChatGPT conversation array
-    if (parsedJson.length > 0 && parsedJson[0] && parsedJson[0].mapping) {
+    if (parsedJson.length === 0) return [];
+
+    // Subcase 1A: ChatGPT conversation array: [ { title, mapping, current_node }, ... ]
+    if (parsedJson[0]?.mapping) {
       return parsedJson.map((convo) => extractFromConversation(convo, { includeSystem, fixMojibake, onlyActive }));
     }
 
-    // Check if Claude conversations array
-    if (parsedJson.length > 0 && parsedJson[0] && parsedJson[0].chat_messages) {
-      return parsedJson.map((convo, idx) => {
-        const msgs = (convo.chat_messages || []).map((m, mIdx) => ({
-          id: m.uuid || `msg-${mIdx}`,
-          sender: m.sender === 'human' ? 'user' : (m.sender === 'assistant' ? 'assistant' : m.sender || 'unknown'),
-          message: fixMojibake ? repairMojibake(m.text || '') : (m.text || ''),
-          create_time: m.created_at || null,
-        })).filter(m => includeSystem || m.sender === 'user' || m.sender === 'assistant');
+    // Subcase 1B: Conversations array with messages list: [ { title, messages: [...] }, ... ]
+    if (parsedJson[0]?.messages && Array.isArray(parsedJson[0].messages)) {
+      return parsedJson.map((convo) => extractFromMessagesArray(convo, convo.messages, { includeSystem, fixMojibake }));
+    }
 
-        return {
-          id: convo.uuid || `convo-${idx}`,
-          title: convo.name || `Claude Chat ${idx + 1}`,
-          create_time: convo.created_at || null,
-          messages: msgs,
-        };
+    // Subcase 1C: Claude conversations array: [ { name, chat_messages: [...] }, ... ]
+    if (parsedJson[0]?.chat_messages) {
+      return parsedJson.map((convo, idx) => {
+        return extractFromMessagesArray(
+          { title: convo.name || `Claude Chat ${idx + 1}`, id: convo.uuid, create_time: convo.created_at },
+          convo.chat_messages,
+          { includeSystem, fixMojibake }
+        );
       });
     }
 
-    // Check if simple messages array: [ { sender/role, message/content } ]
-    const sample = parsedJson[0];
-    if (sample && (sample.sender || sample.role) && (sample.message || sample.content || sample.text)) {
-      const msgs = parsedJson.map((item, idx) => {
-        const sender = item.sender || item.role || 'user';
-        let rawContent = item.message || item.content || item.text || '';
-        if (typeof rawContent === 'object') {
-          rawContent = getTextFromContent(rawContent, fixMojibake);
-        } else if (fixMojibake) {
-          rawContent = repairMojibake(rawContent);
-        }
-        return {
-          id: item.id || `msg-${idx}`,
-          sender,
-          message: String(rawContent).trim(),
-          create_time: item.create_time || item.timestamp || null,
-        };
-      }).filter(m => includeSystem || m.sender === 'user' || m.sender === 'assistant');
-
-      return [{
-        id: 'imported-chat',
-        title: 'Imported Messages',
-        create_time: Date.now() / 1000,
-        messages: msgs,
-      }];
-    }
+    // Subcase 1D: Simple messages array: [ { author/sender/role, content/message/text }, ... ]
+    return [extractFromMessagesArray(
+      { title: "Imported Messages", create_time: Date.now() / 1000 },
+      parsedJson,
+      { includeSystem, fixMojibake }
+    )];
   }
 
-  // Case 2: Single ChatGPT conversation object: { title, mapping, current_node }
+  // Case 2: Single conversation object
   if (parsedJson && typeof parsedJson === 'object') {
+    // 2A: Standard ChatGPT object with mapping
     if (parsedJson.mapping) {
       return [extractFromConversation(parsedJson, { includeSystem, fixMojibake, onlyActive })];
     }
 
-    // If wrapped in { conversation: { mapping } } or { data: { mapping } }
-    if (parsedJson.conversation && parsedJson.conversation.mapping) {
+    // 2B: Wrapper object: { conversation: { mapping } }
+    if (parsedJson.conversation?.mapping) {
       return [extractFromConversation(parsedJson.conversation, { includeSystem, fixMojibake, onlyActive })];
     }
 
-    // If object with messages array: { messages: [...] }
+    // 2C: Single ChatGPT / API object with messages array (e.g. { title, messages: [...] })
     if (Array.isArray(parsedJson.messages)) {
-      return parseChatData(parsedJson.messages, options);
+      return [extractFromMessagesArray(parsedJson, parsedJson.messages, { includeSystem, fixMojibake })];
+    }
+
+    // 2D: Claude single conversation: { name, chat_messages: [...] }
+    if (Array.isArray(parsedJson.chat_messages)) {
+      return [extractFromMessagesArray(
+        { title: parsedJson.name || "Claude Conversation", create_time: parsedJson.created_at },
+        parsedJson.chat_messages,
+        { includeSystem, fixMojibake }
+      )];
     }
   }
 
@@ -270,7 +368,6 @@ export function toHtmlDocument(messages, title = "Conversation") {
       const icon = isUser ? "👤 User" : item.sender === "assistant" ? "🤖 Assistant" : "⚙️ System";
       const timeStr = item.create_time ? `<span style="font-size: 12px; opacity: 0.7; font-weight: normal;"> • ${formatTimestamp(item.create_time)}</span>` : "";
 
-      // Escape HTML
       const escaped = item.message
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
